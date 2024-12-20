@@ -1,33 +1,7 @@
-"""
-Campaign Report Generator
-
-Generates formatted Markdown and Text reports for tracking media campaign status across different retailers.
-Tracks changes between report generations and maintains historical data for comparison.
-Sends generated reports via email using configured SMTP server.
-
-Improvements TODO:
-- Create separate modules:
-    - config.py - Configuration handling
-    - data_processing.py - Data loading and processing
-    - report_generators.py - Report generation logic
-    - email_handler.py - Email functionality
-    - utils.py - Shared utilities
-- Separate constants to config file.
-- Improve error handling and logging.
-- Add context managers for file operations and resource handling.
-- Add more specific type hints using TypeVar and Protocol.
-- Use dataclasses for data containers.
-- Replace string concatenation with f-strings.
-- Add unit tests for core functions.
-    
-"""
-
 import os
 import sys
-import yaml
 import logging
 import hashlib
-import argparse
 import pandas as pd
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -35,15 +9,10 @@ from typing import List, Tuple, Optional, Any, TextIO, Union
 from dataclasses import dataclass
 
 import smtplib
-from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
 
 # Constants
 REQUIRED_COLUMNS = [
@@ -287,33 +256,6 @@ class CampaignReportEmailer:
                     server.quit()
                 except:
                     pass
-
-
-@dataclass
-class Config:
-    """Configuration container for the report generator"""
-
-    input_csv: Path
-    output_dir: Path
-    email_template: Optional[str] = None
-
-    @classmethod
-    def from_yaml(cls, path: str) -> "Config":
-        """Create Config instance from YAML file"""
-        try:
-            with open(path) as f:
-                data = yaml.safe_load(f)
-
-            if not all(key in data for key in ["input_offsite_csv", "output_dir"]):
-                raise DataValidationError("Missing required configuration keys")
-
-            return cls(
-                input_csv=Path(data["input_offsite_csv"]),
-                output_dir=Path(data["output_dir"]),
-                email_template=data.get("email_template"),
-            )
-        except (yaml.YAMLError, IOError) as e:
-            raise DataValidationError(f"Failed to load configuration: {e}")
 
 
 def get_campaign_hash(row: pd.Series) -> str:
@@ -1050,76 +992,3 @@ def generate_reports(
     generate_email_report(df, email_path)
 
     return md_path, email_path
-
-
-def main(config_path: str) -> None:
-    """
-    Main function to run the campaign report generator and send email reports
-
-    Args:
-        config_path: Path to configuration YAML file
-    """
-    try:
-        setup_logging()
-        config = Config.from_yaml(config_path)
-
-        # Ensure output directory exists
-        config.output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Read and process data
-        df = read_and_clean_data(config.input_csv)
-
-        # Set up history directory and process changes
-        history_dir = config.output_dir / "campaign_history"
-        history_dir.mkdir(exist_ok=True)
-
-        # Load historical data and find changes once
-        historical_df = load_historical_data(history_dir)
-        df = find_changes(df, historical_df)
-
-        # Save current data as historical
-        save_historical_data(df, history_dir)
-
-        # Generate both reports using the processed dataframe
-        # Add cleanup of reports older than 30 days
-        md_path, email_path = generate_reports(
-            df,
-            history_dir,
-            config.output_dir,
-            cleanup_days=30,  # Can be made configurable through YAML if needed
-        )
-        logging.info(
-            f"Reports generated and saved to:\nMarkdown: {md_path}\nEmail: {email_path}"
-        )
-
-        # Send email if configured
-        if os.getenv("EMAIL_SENDER"):
-            logging.info("Email configuration found. Attempting to send reports...")
-            success = send_reports_by_email(md_path=md_path, txt_path=email_path)
-            if success:
-                logging.info("Campaign reports sent successfully via email")
-            else:
-                logging.error("Failed to send campaign reports via email")
-        else:
-            logging.info("No email configuration found. Skipping email send.")
-
-        logging.info("Campaign report generation completed")
-
-    except CampaignReportError as e:
-        logging.error(f"Failed to generate reports: {e}")
-        sys.exit(1)
-    except Exception as e:
-        logging.error(f"Unexpected error: {e}")
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Generate Campaign Status Reports",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
-        "--config", type=str, default="config.yaml", help="Path to configuration file"
-    )
-    args = parser.parse_args()
-    main(args.config)
