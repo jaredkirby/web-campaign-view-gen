@@ -1,0 +1,14 @@
+# Web interface
+streamlit>=1.31.0
+
+# Core dependencies from campaign report generator
+pandas>=2.2.0
+
+# Email handling
+secure-smtplib>=0.1.1
+
+# Optional: Development dependencies
+black>=24.1.1  # Code formatting
+pylint>=3.0.3  # Code analysis
+pytest>=8.0.0  # Testing
+pytest-cov>=4.1.0  # Test coverage
