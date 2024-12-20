@@ -15,7 +15,7 @@ A Streamlit web application for generating and sending campaign status reports. 
 1. Clone the repository:
 
 ```bash
-git clone [repository-url]
+git clone https://github.com/jaredkirby/web-campaign-view-gen
 cd web-campaign-view-gen
 ```
 
