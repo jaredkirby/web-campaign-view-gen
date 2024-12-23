@@ -143,14 +143,14 @@ class EmailConfig:
 class CampaignReportEmailer:
     """Handles sending campaign reports via email"""
 
-    def __init__(self, config: EmailConfig):
+    def __init__(self, config: EmailConfig, sender_password: Optional[str] = None):
         self.config = config
         self.logger = logging.getLogger(__name__)
 
-        # Get password from environment
-        self.sender_password = os.getenv("EMAIL_SENDER_PASSWORD")
+        # Get password from parameter or environment
+        self.sender_password = sender_password or os.getenv("EMAIL_SENDER_PASSWORD")
         if not self.sender_password:
-            raise ValueError("Email sender password not found in environment variables")
+            raise ValueError("Email sender password not provided")
 
     def setup_email_client(self) -> smtplib.SMTP:
         """Initialize and authenticate SMTP client"""

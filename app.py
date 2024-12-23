@@ -198,7 +198,21 @@ def send_email_reports(
         os.environ["EMAIL_CC_RECIPIENTS"] = cc_recipients
 
         md_path, email_path = st.session_state.report_paths
-        success = send_reports_by_email(md_path, email_path)
+
+        # Create EmailConfig directly
+        config = EmailConfig(
+            sender_email=sender_email,
+            primary_recipients=primary_recipients.split(","),
+            cc_recipients=cc_recipients.split(",") if cc_recipients else [],
+        )
+
+        # Create emailer with configuration and password
+        emailer = CampaignReportEmailer(config, sender_password)
+
+        # Send the report
+        success = emailer.send_campaign_report(
+            md_path, email_path, datetime.now().strftime("%Y-%m-%d")
+        )
 
         if success:
             st.session_state.email_sent = True
