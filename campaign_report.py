@@ -1,12 +1,12 @@
 import os
-import sys
+import re
 import logging
 import hashlib
 import pandas as pd
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List, Tuple, Optional, Any, TextIO, Union
-from dataclasses import dataclass
+from typing import List, Tuple, Optional, Any, TextIO, Union, Dict
+from dataclasses import dataclass, field
 
 import smtplib
 from email.mime.multipart import MIMEMultipart
@@ -23,7 +23,6 @@ REQUIRED_COLUMNS = [
     "Tactic Brand",
     "Event Name",
     "Tactic Name",
-    "Tactic Description",
     "Tactic Product",
     "Tactic Order ID",
     "Event ID",
@@ -76,6 +75,17 @@ def setup_logging() -> None:
     # Reduce logging level for some noisy libraries
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("pandas").setLevel(logging.WARNING)
+
+
+@dataclass
+class CampaignSubGroup:
+    """Represents a group of related sub-campaigns"""
+
+    base_name: str
+    total_budget: float = 0.0
+    sub_campaigns: List[Dict] = field(default_factory=list)
+    start_dates: List[str] = field(default_factory=list)
+    budget_types: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -258,6 +268,354 @@ class CampaignReportEmailer:
                     pass
 
 
+# Onsite Section
+
+
+def identify_tactic_type(tactic_name: str) -> str:
+    """
+    Identify the base tactic type from the name
+
+    Args:
+        tactic_name: Full tactic name (e.g., "Paid Search - Ecomm")
+
+    Returns:
+        Base tactic type or None if no match
+    """
+    patterns = {
+        "Paid Search": r"paid\s+search",
+        "Sponsored Video": r"sponsored\s+video",
+        "Sponsored Brand": r"sponsored\s+brand",
+    }
+
+    tactic_lower = tactic_name.lower()
+    for tactic_type, pattern in patterns.items():
+        if re.search(pattern, tactic_lower):
+            return tactic_type
+
+    return tactic_name
+
+
+def identify_base_campaign_type(tactic_name: str) -> str:
+    """
+    Extract the base campaign type from the tactic name
+
+    Args:
+        tactic_name: Full tactic name (e.g., "Paid Search - Ecomm")
+
+    Returns:
+        Base campaign type (e.g., "Paid Search")
+    """
+    # Common campaign type patterns
+    patterns = [
+        r"paid\s+search",
+        r"sponsored\s+video",
+        r"sponsored\s+brand",
+        r"display",
+        r"onsite\s+display",
+    ]
+
+    # Convert to lowercase for matching
+    name_lower = tactic_name.lower()
+
+    # Try to match known patterns
+    for pattern in patterns:
+        if match := re.search(pattern, name_lower):
+            return match.group(0).title()
+
+    # If no pattern matches, return the full name
+    return tactic_name
+
+
+def is_paid_search(tactic_name: str) -> bool:
+    """Check if a campaign is a Paid Search campaign"""
+    return bool(re.search(r"paid\s+search", tactic_name.lower()))
+
+
+def should_combine_paid_search(campaign1: pd.Series, campaign2: pd.Series) -> bool:
+    """
+    Determine if two Paid Search campaigns should be combined.
+    Only combines if they share vendor, product, and start month.
+
+    Args:
+        campaign1: First campaign data
+        campaign2: Second campaign data
+
+    Returns:
+        bool: True if campaigns should be combined
+    """
+    # Both must be Paid Search campaigns
+    if not (
+        is_paid_search(campaign1["Tactic Name"])
+        and is_paid_search(campaign2["Tactic Name"])
+    ):
+        return False
+
+    # Must match on vendor and product
+    if (
+        campaign1["Tactic Vendor"] != campaign2["Tactic Vendor"]
+        or campaign1["Tactic Product"] != campaign2["Tactic Product"]
+    ):
+        return False
+
+    # Must start in same month
+    start_month1 = pd.to_datetime(campaign1["Tactic Start Date"]).to_period("M")
+    start_month2 = pd.to_datetime(campaign2["Tactic Start Date"]).to_period("M")
+
+    return start_month1 == start_month2
+
+
+def should_combine_campaigns(campaign1: pd.Series, campaign2: pd.Series) -> bool:
+    """
+    Determine if two campaigns should be combined based on tactic type
+
+    Args:
+        campaign1: First campaign data
+        campaign2: Second campaign data
+
+    Returns:
+        bool: True if campaigns should be combined
+    """
+    tactic1 = identify_tactic_type(campaign1["Tactic Name"])
+    tactic2 = identify_tactic_type(campaign2["Tactic Name"])
+
+    # Must be same tactic type
+    if tactic1 != tactic2:
+        return False
+
+    # Must match on these fields regardless of tactic type
+    base_criteria = ["Tactic Vendor", "Tactic Brand", "Tactic Product"]
+
+    if not all(campaign1[field] == campaign2[field] for field in base_criteria):
+        return False
+
+    # Special handling for Paid Search
+    if tactic1 == "Paid Search":
+        # Must start in same month for Paid Search
+        start_month1 = pd.to_datetime(campaign1["Tactic Start Date"]).to_period("M")
+        start_month2 = pd.to_datetime(campaign2["Tactic Start Date"]).to_period("M")
+        return start_month1 == start_month2
+
+    # For Sponsored Video and Sponsored Brand, combine if they share all base criteria
+    # (which we've already checked above)
+    return True
+
+
+def aggregate_onsite_campaigns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate onsite campaign data based on tactic type rules
+
+    Args:
+        df: DataFrame containing campaign data
+
+    Returns:
+        DataFrame with aggregated campaign data
+    """
+    # Create month column for initial grouping
+    df["Month"] = pd.to_datetime(df["Tactic Start Date"]).dt.to_period("M")
+
+    # Initial grouping by retailer
+    grouped = df.groupby("Retailer")
+
+    aggregated_data = []
+
+    for retailer, group_df in grouped:
+        processed_campaigns = set()  # Track which campaigns have been processed
+
+        # Process campaigns
+        for _, campaign in group_df.iterrows():
+            if campaign["Tactic Order ID"] in processed_campaigns:
+                continue
+
+            # Find related campaigns
+            related_campaigns = [
+                row
+                for _, row in group_df.iterrows()
+                if (
+                    row["Tactic Order ID"] not in processed_campaigns
+                    and should_combine_campaigns(campaign, row)
+                )
+            ]
+
+            if len(related_campaigns) > 1:  # Include the current campaign
+                # Create combined campaign entry
+                main_row = campaign.to_dict()
+                total_budget = sum(
+                    c["Tactic Allocated Budget"] for c in related_campaigns
+                )
+                main_row["Tactic Allocated Budget"] = total_budget
+
+                # Sort sub-lines by start date and budget type
+                sorted_campaigns = sorted(
+                    related_campaigns,
+                    key=lambda x: (x["Tactic Start Date"], x["Budget Type"]),
+                )
+
+                main_row["Sub_Lines"] = [
+                    {
+                        "start_date": str(c["Tactic Start Date"]),
+                        "budget": c["Tactic Allocated Budget"],
+                        "budget_type": c["Budget Type"],
+                        "tactic_name": c["Tactic Name"],
+                        "order_id": c["Tactic Order ID"],
+                    }
+                    for c in sorted_campaigns
+                ]
+
+                main_row["Is_Combined"] = True
+                main_row["Budget_Types"] = list(
+                    {c["Budget Type"] for c in sorted_campaigns}
+                )
+
+                aggregated_data.append(main_row)
+                processed_campaigns.update(
+                    c["Tactic Order ID"] for c in related_campaigns
+                )
+
+            elif campaign["Tactic Order ID"] not in processed_campaigns:
+                # Add single campaign as is
+                campaign_dict = campaign.to_dict()
+                campaign_dict["Is_Combined"] = False
+                campaign_dict["Sub_Lines"] = [
+                    {
+                        "start_date": str(campaign["Tactic Start Date"]),
+                        "budget": campaign["Tactic Allocated Budget"],
+                        "budget_type": campaign["Budget Type"],
+                        "tactic_name": campaign["Tactic Name"],
+                        "order_id": campaign["Tactic Order ID"],
+                    }
+                ]
+                aggregated_data.append(campaign_dict)
+                processed_campaigns.add(campaign["Tactic Order ID"])
+
+    # Convert back to DataFrame
+    result_df = pd.DataFrame(aggregated_data)
+    result_df.drop("Month", axis=1, inplace=True, errors="ignore")
+
+    # Sort by start date and budget
+    result_df.sort_values(
+        ["Tactic Start Date", "Tactic Allocated Budget"],
+        ascending=[True, False],
+        inplace=True,
+    )
+
+    return result_df
+
+
+def format_campaign_for_email_onsite(campaign: pd.Series, indent_level: int = 0) -> str:
+    """Enhanced formatter for onsite campaign details in email output"""
+    indent = "  " * indent_level
+    start_date = format_date(pd.to_datetime(campaign["Tactic Start Date"]))
+    end_date = format_date(pd.to_datetime(campaign["Tactic End Date"]))
+    budget = campaign["Tactic Allocated Budget"]
+
+    changes = campaign.get("changes", [])
+    change_indicator = "[UPDATED] " if changes and changes != ["New Campaign"] else ""
+    new_indicator = "[NEW] " if changes and changes == ["New Campaign"] else ""
+
+    lines = [
+        f"{indent}{change_indicator}{new_indicator}{campaign['Retailer']} - {campaign['Tactic Brand']}",
+        f"{indent}Product: {campaign['Tactic Product']}",
+    ]
+
+    # Handle combined campaigns differently
+    if campaign.get("Is_Combined", False):
+        lines.append(
+            f"{indent}Combined Campaign Group: {identify_base_campaign_type(campaign['Tactic Name'])}"
+        )
+        lines.append(f"{indent}Total Combined Budget: {format_budget(budget)}")
+        lines.append(f"{indent}Budget Sources: {', '.join(campaign['Budget_Types'])}")
+        lines.append(f"{indent}Sub-campaigns:")
+
+        for sub in campaign["Sub_Lines"]:
+            sub_date = format_date(pd.to_datetime(sub["start_date"]))
+            lines.append(
+                f"{indent}  - {sub['tactic_name']} (Order ID: {sub['order_id']})"
+            )
+            lines.append(
+                f"{indent}    Start Date: {sub_date}, Budget: {format_budget(sub['budget'])} ({sub['budget_type']})"
+            )
+    else:
+        lines.extend(
+            [
+                f"{indent}Campaign: {campaign['Tactic Name']}",
+                f"{indent}Dates: {start_date} to {end_date}",
+                f"{indent}Budget: {format_budget(budget)} ({campaign['Budget Type']})",
+                f"{indent}Order ID: {campaign['Tactic Order ID']}",
+            ]
+        )
+
+    if campaign.get("Tactic Vendor"):
+        lines.append(f"{indent}Vendor: {campaign['Tactic Vendor']}")
+
+    if changes and changes != ["New Campaign"]:
+        lines.append(f"{indent}Changes:")
+        for change in changes:
+            lines.append(f"{indent}  * {change}")
+
+    lines.append("")  # Add blank line
+    return "\n".join(lines)
+
+
+def write_campaign_details_onsite(
+    md_file: TextIO, campaign: pd.Series, indent_level: int = 0
+) -> None:
+    """Write onsite campaign details to markdown file, handling sub-lines"""
+    indent = "  " * indent_level
+    start_date = format_date(pd.to_datetime(campaign["Tactic Start Date"]))
+    end_date = format_date(pd.to_datetime(campaign["Tactic End Date"]))
+    budget = campaign["Tactic Allocated Budget"]
+
+    changes = campaign.get("changes", [])
+    change_indicator = "⚠️ " if changes and changes != ["New Campaign"] else ""
+
+    md_file.write(
+        f"{indent}- **{change_indicator}{campaign['Retailer']}** - {campaign['Tactic Brand']}\n"
+    )
+
+    if changes and changes == ["New Campaign"]:
+        md_file.write(f"{indent}  - 🆕 **New Campaign**\n")
+
+    md_file.write(f"{indent}  - Product: {campaign['Tactic Product']}\n")
+    md_file.write(f"{indent}  - Campaign: {campaign['Tactic Name']}\n")
+
+    if "Tactic Description" in campaign and not pd.isna(campaign["Tactic Description"]):
+        md_file.write(f"{indent}  - Description: {campaign['Tactic Description']}\n")
+    if "Tactic Vendor" in campaign and not pd.isna(campaign["Tactic Vendor"]):
+        md_file.write(f"{indent}  - Vendor: {campaign['Tactic Vendor']}\n")
+
+    # Handle sub-lines if present
+    has_sub_lines = (
+        isinstance(campaign.get("Sub_Lines"), list) and campaign["Sub_Lines"]
+    )
+
+    if has_sub_lines:
+        md_file.write(f"{indent}  - Total Budget: {format_budget(budget)}\n")
+        md_file.write(f"{indent}  - Campaign Schedule:\n")
+        for sub_line in campaign["Sub_Lines"]:
+            sub_date = format_date(pd.to_datetime(sub_line["start_date"]))
+            sub_budget = format_budget(sub_line["budget"])
+            md_file.write(
+                f"{indent}    - {sub_line['tactic_name']} (Order ID: {sub_line['order_id']})\n"
+            )
+            md_file.write(
+                f"{indent}      Start Date: {sub_date}, Budget: {sub_budget} ({sub_line['budget_type']})\n"
+            )
+    else:
+        md_file.write(f"{indent}  - Dates: {start_date} to {end_date}\n")
+        md_file.write(f"{indent}  - Budget: {format_budget(budget)}\n")
+        md_file.write(f"{indent}  - Order ID: {campaign['Tactic Order ID']}\n")
+
+    if changes and changes != ["New Campaign"]:
+        md_file.write(f"{indent}  - **Changes Detected:**\n")
+        for change in changes:
+            md_file.write(f"{indent}    - {change}\n")
+
+    md_file.write("\n")
+
+
+# end onsite section
+
+
 def get_campaign_hash(row: pd.Series) -> str:
     """
     Create a unique identifier for each campaign based on key fields
@@ -361,63 +719,87 @@ def format_campaign_for_email(campaign: pd.Series, indent_level: int = 0) -> str
 
 def read_and_clean_data(file_path: Path) -> pd.DataFrame:
     """
-    Read and clean the CSV data, ensuring all required fields are present and properly formatted
-
-    Args:
-        file_path: Path to input CSV file
-
-    Returns:
-        DataFrame: Cleaned and validated campaign data
-
-    Raises:
-        DataValidationError: If data validation fails
+    Read and clean the CSV data with enhanced debugging
     """
     logging.info(f"Reading data from {file_path}")
-    if not validate_file_path(file_path, "CSV"):
-        raise DataValidationError(f"Invalid file path: {file_path}")
 
     try:
+        # Read file content for inspection
+        with open(file_path, "r", encoding="utf-8") as f:
+            first_line = f.readline().strip()
+        logging.info(f"First line of file: {first_line}")
+
+        # Read CSV file
         df = pd.read_csv(file_path)
+        logging.info(f"Initial row count: {len(df)}")
+        logging.info(f"Initial columns: {df.columns.tolist()}")
+
+        # Validate required columns
+        missing_columns = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+        if missing_columns:
+            raise DataValidationError(f"Missing required columns: {missing_columns}")
+
+        # Clean data
+        df = df[df["Tactic Start Date"].notnull()]
+        logging.info(f"Rows after null date removal: {len(df)}")
+
+        df = df[
+            ~df["Tactic Start Date"]
+            .astype(str)
+            .str.contains("Grand Total|Total|Summary", na=False, case=False)
+        ]
+        logging.info(f"Rows after summary removal: {len(df)}")
+
+        # Convert Event ID to integer
+        df["Event ID"] = (
+            pd.to_numeric(df["Event ID"], errors="coerce").fillna(0).astype(int)
+        )
+
+        # Convert dates using the YYYY-MM-DD format
+        for date_col in DATE_COLUMNS:
+            logging.info(f"Processing {date_col}")
+            logging.info(f"Sample values before conversion: {df[date_col].head()}")
+
+            df[date_col] = pd.to_datetime(df[date_col], format="%Y-%m-%d")
+
+            logging.info(f"Sample values after conversion: {df[date_col].head()}")
+
+        # Remove invalid dates
+        df = df[df["Tactic Start Date"].notnull() & df["Tactic End Date"].notnull()]
+        logging.info(f"Rows after invalid date removal: {len(df)}")
+
+        # Normalize dates
+        df["Tactic Start Date"] = df["Tactic Start Date"].dt.normalize()
+        df["Tactic End Date"] = df["Tactic End Date"].dt.normalize()
+
+        # Convert budget values
+        logging.info(f"Sample budget values: {df['Tactic Allocated Budget'].head()}")
+        df["Tactic Allocated Budget"] = pd.to_numeric(
+            df["Tactic Allocated Budget"], errors="coerce"
+        ).fillna(0)
+
+        # Add optional columns
+        optional_columns = ["Tactic Description", "Tactic Vendor", "Budget Type"]
+        for col in optional_columns:
+            if col not in df.columns:
+                df[col] = ""
+            else:
+                df[col] = df[col].fillna("")
+
+        # Sort data
+        sort_cols = ["Tactic Start Date", "Retailer", "Tactic Brand"]
+        df = df.sort_values(sort_cols)
+
+        # Final validation
+        logging.info(f"Final row count: {len(df)}")
+        logging.info("Sample of final data:")
+        logging.info(df.head().to_string())
+
+        return df
+
     except Exception as e:
-        raise DataValidationError(f"Failed to read CSV file: {e}")
-
-    # Validate required columns
-    missing_columns = [col for col in REQUIRED_COLUMNS if col not in df.columns]
-    if missing_columns:
-        raise DataValidationError(f"Missing required columns: {missing_columns}")
-
-    # Clean data
-    df = df[df["Tactic Start Date"].notnull()]
-    df = df[
-        ~df["Tactic Start Date"]
-        .astype(str)
-        .str.contains("Grand Total|Total|Summary", na=False, case=False)
-    ]
-
-    # Convert Event ID to integer
-    df["Event ID"] = df["Event ID"].astype(int)
-
-    # Convert dates
-    for date_col in DATE_COLUMNS:
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-
-    # Remove invalid dates
-    df = df[df["Tactic Start Date"].notnull() & df["Tactic End Date"].notnull()]
-
-    # Normalize dates and budget
-    df["Tactic Start Date"] = df["Tactic Start Date"].dt.normalize()
-    df["Tactic End Date"] = df["Tactic End Date"].dt.normalize()
-    df["Tactic Allocated Budget"] = pd.to_numeric(
-        df["Tactic Allocated Budget"], errors="coerce"
-    ).fillna(0)
-    df["Tactic Vendor"] = df["Tactic Vendor"].fillna("")
-    df["Tactic Description"] = df["Tactic Description"].fillna("")
-
-    # Sort for consistency
-    df = df.sort_values(["Tactic Start Date", "Retailer", "Tactic Brand"])
-
-    logging.info(f"Successfully processed {len(df)} campaigns")
-    return df
+        logging.error(f"Error in data processing: {str(e)}", exc_info=True)
+        raise
 
 
 def load_historical_data(history_dir: Path) -> Optional[pd.DataFrame]:
@@ -659,9 +1041,12 @@ def write_campaign_details(
 
 
 def write_campaign_section(
-    md_file: Any, campaigns: pd.DataFrame, section_title: str
+    md_file: Any,
+    campaigns: pd.DataFrame,
+    section_title: str,
+    campaign_formatter=write_campaign_details,
 ) -> None:
-    """Write a section of campaigns to markdown file"""
+    """Write a section of campaigns to markdown file with custom formatter support"""
     if not campaigns.empty:
         total_budget = campaigns["Tactic Allocated Budget"].sum()
         campaign_count = len(campaigns)
@@ -698,7 +1083,7 @@ def write_campaign_section(
                     )
 
                     for _, campaign in retailer_campaigns.iterrows():
-                        write_campaign_details(md_file, campaign)
+                        campaign_formatter(md_file, campaign)
 
                 md_file.write("\n")
         else:
@@ -710,7 +1095,7 @@ def write_campaign_section(
                 md_file.write(f"## {retailer} ({format_budget(retailer_budget)})\n\n")
 
                 for _, campaign in retailer_campaigns.iterrows():
-                    write_campaign_details(md_file, campaign)
+                    campaign_formatter(md_file, campaign)
 
         md_file.write("---\n\n")
     else:
@@ -718,14 +1103,20 @@ def write_campaign_section(
         md_file.write("*No campaigns in this category.*\n\n---\n\n")
 
 
-def generate_checklist(df: pd.DataFrame, history_dir: Path, output_path: Path) -> None:
+def generate_checklist(
+    df: pd.DataFrame,
+    history_dir: Path,
+    output_path: Path,
+    campaign_formatter=write_campaign_details,
+) -> None:
     """
-    Generate the campaign checklist report
+    Generate the campaign checklist report with custom formatter support
 
     Args:
         df: Campaign data (already processed with changes)
         history_dir: Directory containing historical data
         output_path: Path to save the generated report
+        campaign_formatter: Function to format campaign details
     """
     logging.info(f"Generating checklist and saving to {output_path}")
     current_date = datetime.now().strftime("%Y-%m-%d")
@@ -766,13 +1157,19 @@ def generate_checklist(df: pd.DataFrame, history_dir: Path, output_path: Path) -
 
             md_file.write("---\n\n")
 
-            # Write each section
-            write_campaign_section(
-                md_file, current_campaigns, "Currently Active Campaigns"
-            )
-            write_campaign_section(md_file, future_campaigns, "Upcoming Campaigns")
-            write_campaign_section(md_file, past_campaigns, "Completed Campaigns")
-            pass
+            # Write each section using the provided formatter
+            for section_title, section_data in [
+                ("Currently Active Campaigns", current_campaigns),
+                ("Upcoming Campaigns", future_campaigns),
+                ("Completed Campaigns", past_campaigns),
+            ]:
+                write_campaign_section(
+                    md_file,
+                    section_data,
+                    section_title,
+                    campaign_formatter=campaign_formatter,
+                )
+
         # Atomic rename for safer file writing
         temp_path.replace(output_path)
     except Exception as e:
@@ -782,9 +1179,23 @@ def generate_checklist(df: pd.DataFrame, history_dir: Path, output_path: Path) -
 
 
 def write_email_section(
-    campaigns: pd.DataFrame, section_title: str, indent_level: int = 0
+    campaigns: pd.DataFrame,
+    section_title: str,
+    indent_level: int = 0,
+    campaign_formatter=format_campaign_for_email,
 ) -> str:
-    """Generate email section content"""
+    """
+    Generate email section content with custom formatter support
+
+    Args:
+        campaigns: DataFrame containing campaign data
+        section_title: Title for the section
+        indent_level: Level of indentation for formatting
+        campaign_formatter: Function to format individual campaign details
+
+    Returns:
+        str: Formatted section content
+    """
     lines = []
     indent = "  " * indent_level
 
@@ -823,9 +1234,7 @@ def write_email_section(
                     lines.append("")
 
                     for _, campaign in retailer_campaigns.iterrows():
-                        lines.append(
-                            format_campaign_for_email(campaign, indent_level + 2)
-                        )
+                        lines.append(campaign_formatter(campaign, indent_level + 2))
 
                 lines.append("")
         else:
@@ -838,7 +1247,7 @@ def write_email_section(
                 lines.append("")
 
                 for _, campaign in retailer_campaigns.iterrows():
-                    lines.append(format_campaign_for_email(campaign, indent_level + 1))
+                    lines.append(campaign_formatter(campaign, indent_level + 1))
 
         lines.append("-" * 80)
         lines.append("")
@@ -856,8 +1265,17 @@ def write_email_section(
     return "\n".join(lines)
 
 
-def generate_email_report(df: pd.DataFrame, output_path: Path) -> None:
-    """Generate email-friendly campaign report"""
+def generate_email_report(
+    df: pd.DataFrame, output_path: Path, campaign_formatter=format_campaign_for_email
+) -> None:
+    """
+    Generate email-friendly campaign report with custom formatter support
+
+    Args:
+        df: Campaign data DataFrame
+        output_path: Path to save the report
+        campaign_formatter: Function to format campaign details
+    """
     current_date = datetime.now().strftime("%Y-%m-%d")
 
     # Categorize campaigns
@@ -893,7 +1311,7 @@ def generate_email_report(df: pd.DataFrame, output_path: Path) -> None:
         ]
     )
 
-    # Add each section
+    # Add each section with custom formatter
     sections = [
         ("CURRENTLY ACTIVE CAMPAIGNS", current_campaigns),
         ("UPCOMING CAMPAIGNS", future_campaigns),
@@ -901,7 +1319,9 @@ def generate_email_report(df: pd.DataFrame, output_path: Path) -> None:
     ]
 
     for title, campaigns in sections:
-        lines.append(write_email_section(campaigns, title))
+        lines.append(
+            write_email_section(campaigns, title, campaign_formatter=campaign_formatter)
+        )
 
     # Write to file
     with open(output_path, "w", encoding="utf-8") as f:
@@ -955,40 +1375,80 @@ def cleanup_old_reports(output_dir: Path, days_to_keep: int = 30) -> None:
                 logging.warning(f"Failed to clean up {file}: {e}")
 
 
+def process_campaign_data(
+    df: pd.DataFrame, campaign_type: str = "offsite"
+) -> pd.DataFrame:
+    """
+    Process campaign data based on type (onsite or offsite)
+
+    Args:
+        df: Input DataFrame with campaign data
+        campaign_type: Either 'onsite' or 'offsite'
+
+    Returns:
+        Processed DataFrame
+    """
+    if campaign_type.lower() == "onsite":
+        return aggregate_onsite_campaigns(df)
+    return df  # For offsite, return as-is
+
+
 def generate_reports(
     df: pd.DataFrame,
     history_dir: Path,
     output_dir: Path,
     cleanup_days: Optional[int] = 30,
+    campaign_type: str = "offsite",
 ) -> Tuple[Path, Path]:
     """
-    Generate both markdown and email reports
+    Generate both markdown and email reports with campaign type support
 
     Args:
         df: Campaign data
         history_dir: Directory for historical data
         output_dir: Directory for output files
         cleanup_days: Days to keep old reports (None to skip cleanup)
+        campaign_type: Either 'onsite' or 'offsite'
 
     Returns:
         Tuple[Path, Path]: Paths to generated markdown and email reports
     """
-    logging.info("Generating markdown and email reports")
+    logging.info(f"Generating {campaign_type} campaign reports")
+
+    # Process data based on campaign type
+    processed_df = process_campaign_data(df, campaign_type)
 
     # Clean up old reports if requested
     if cleanup_days is not None:
         cleanup_old_reports(output_dir, cleanup_days)
 
-    # Create output filenames
+    # Create output filenames with campaign type indicator
     timestamp = datetime.now().strftime("%Y%m%d")
-    base_md_path = output_dir / f"Campaign_Status_Report_{timestamp}.md"
-    base_email_path = output_dir / f"Campaign_Status_Email_{timestamp}.txt"
+    base_md_path = (
+        output_dir
+        / f"{campaign_type.capitalize()}_Campaign_Status_Report_{timestamp}.md"
+    )
+    base_email_path = (
+        output_dir
+        / f"{campaign_type.capitalize()}_Campaign_Status_Email_{timestamp}.txt"
+    )
 
     md_path = get_unique_filename(base_md_path)
     email_path = get_unique_filename(base_email_path)
 
-    # Generate both reports
-    generate_checklist(df, history_dir, md_path)
-    generate_email_report(df, email_path)
+    # Select appropriate formatters based on campaign type
+    if campaign_type.lower() == "onsite":
+        md_formatter = write_campaign_details_onsite
+        email_formatter = format_campaign_for_email_onsite
+    else:
+        md_formatter = write_campaign_details
+        email_formatter = format_campaign_for_email
+
+    # Generate reports using selected formatters
+    generate_checklist(
+        processed_df, history_dir, md_path, campaign_formatter=md_formatter
+    )
+
+    generate_email_report(processed_df, email_path, campaign_formatter=email_formatter)
 
     return md_path, email_path
